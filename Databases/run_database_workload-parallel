@@ -2,7 +2,12 @@
 
 function display_usage()
 {
-  echo "Usage : $0 -b (benchmark tool) <sysbench, pgbench or hammerdb> -j (job type) <prepare, run or cleanup(sysbench only)> -c config file via full path [-n <optional dir name to keep run logs>]"
+  echo "Usage : $0 -b (benchmark tool) <sysbench, pgbench or hammerdb> -j (job type) <prepare, run or cleanup(sysbench only)> -c (config file) -n (run name)"
+}
+
+function mydate()
+{
+  date +%Y%m%d:%H:%M:%S:
 }
 
 while getopts b:j:c:n:h flag
@@ -21,7 +26,22 @@ if [[ -z ${BENCHMARK_TOOL} || -z ${JOB_TYPE} ]]; then
   exit 1
 fi
 
+[[ -z ${CONFIG_FILE} ]] && CONFIG_FILE=sherlock.config
+
+if [[ -z ${RUN_NAME} ]]; then
+  if [ "$(uname -s)" == "Linux" ];then
+    RUN_NAME=$(cat /dev/urandom | tr -dc "[:lower:]" | head -c 6)
+  else
+    RUN_NAME=$(cat /dev/urandom | LC_CTYPE=C tr -dc "[:lower:]" | head -c 6)
+  fi
+fi
+
 source ${CONFIG_FILE}
+
+if [[ ! -s ${WORKERS_LIST_FILE} || ! -s ${SDS_LIST_FILE} ]]; then
+  echo "$(mydate) worker or sds file are either missing or empty..."
+  exit 1
+fi
 
 if [[ "${BENCHMARK_TOOL}" == "hammerdb" ]]; then
   readonly STATS_COUNT=$(((HAMMERDB_RAMPUP+WORKLOAD_RUNTIME+10)/STATS_INTERVAL))
@@ -52,10 +72,6 @@ else
   fi
 fi
 
-function mydate()
-{
-  date +%Y%m%d:%H:%M:%S:
-}
 
 function get_rbd_list()
 {
@@ -69,7 +85,7 @@ function get_rbd_list()
   done
   for node_name in $(cat $WORKERS_LIST_FILE)
   do
-    local_node_name=$(oc get node ${node_name} -o jsonpath='{.metadata.labels.kubernetes\.io/hostname}')
+    local host_name=$(oc get node ${node_name} -o jsonpath='{.metadata.labels.kubernetes\.io/hostname}')
     rbd_line=""
     node_pvc=$(oc debug node/${node_name} -- lsblk | grep rbd | awk '{print $1"@@"$7}')
     for lsblk_line in $(echo ${node_pvc})
@@ -83,7 +99,7 @@ function get_rbd_list()
       done
     done
     rbd_line=${rbd_line#?}
-    worker_rbd[${local_node_name}]=${rbd_line}
+    worker_rbd[${host_name}]=${rbd_line}
   done
 }
 
@@ -117,6 +133,7 @@ function prepare_run_command()
 
 function start_the_workload_job()
 {
+        #- image: quay.io/sagyvolkov/benchmark-container:sherlock0.3
   local node_name=$(oc get node ${node_name} -o jsonpath='{.metadata.labels.kubernetes\.io/hostname}')
   local db_ip="${1}"
   prepare_run_command
@@ -132,11 +149,12 @@ spec:
       nodeSelector:
         kubernetes.io/hostname: ${node_name}
       containers:
-        - image: quay.io/sagyvolkov/benchmark-container:sherlock0.2
+        - image: quay.io/sagyvolkov/benchmark-container:sherlock0.3
+          imagePullPolicy: Always
           name: ${BENCHMARK_TOOL}-${JOB_TYPE}
           resources:
             limits:
-              memory: 2Gi
+              memory: ${BENCHMARK_POD_MEM_LIMIT}
           command:
                 - "bash"
                 - "-c"
@@ -148,24 +166,48 @@ job_name=$(echo ${job_name} | awk '{print $1}')
 workload_pod_name=$(${KUBE_CMD} describe ${job_name} | grep "Created pod:" | awk -F "Created pod: " '{print $2}')
 }
 
+function find_taints()
+{
+ local node_name="${1}"
+ local node_taint=$(oc get node ${node_name} -o jsonpath='{.spec.taints[0].effect}{"ZZZ"}{.spec.taints[0].key}{"ZZZ"}{.spec.taints[0].value}')
+ if [[ ${node_taint} != "ZZZZZZ" ]];then
+   toleration_effect=$(echo "${node_taint}" | awk -F"ZZZ" '{print $1}')
+   toleration_key=$(echo "${node_taint}" | awk -F"ZZZ" '{print $2}')
+   toleration_value=$(echo "${node_taint}" | awk -F"ZZZ" '{print $3}')
+   if [[ "${toleration_value}" == "" ]]; then
+     toleration=$(echo -e "tolerations:\n      - key: \"${toleration_key}\"\n        operator: \"Exists\"\n        effect: ${toleration_effect}")
+   else
+     toleration=$(echo -e "tolerations:\n      - key: \"${toleration_key}\"\n        value: \"${toleration_value}\"\n        effect: ${toleration_effect}")
+   fi
+ fi
+ 
+ echo "${toleration}"
+}
+
 function run_stats()
 {
-  local node_name=$(oc get node ${node_name} -o jsonpath='{.metadata.labels.kubernetes\.io/hostname}')
+  local toleration=""
   local node_type="${1}"
+  if [[ "${SDS_NODE_TAINTED}" == "true" && "${node_type}" == "sds" ]]; then
+    echo "$(mydate) Checking for tolerations in sds node ${node_name}..."
+    toleration=$(find_taints ${node_name})
+  fi  
+  local node_name=$(oc get node ${node_name} -o jsonpath='{.metadata.labels.kubernetes\.io/hostname}')
   job_name=$(cat <<EOF | ${KUBE_CMD} create -f -
 apiVersion: batch/v1
 kind: Job
 metadata:
-  generateName: stats-${RUN_NAME}-${node_type}-${node_name}-
+  generateName: stats-${node_type}-${RUN_NAME}-${node_name}-
 spec:
   template:
     spec:
+      ${toleration}
       hostNetwork: true
       restartPolicy: Never
       nodeSelector:
         kubernetes.io/hostname: ${node_name}
       containers:
-        - image: quay.io/sagyvolkov/stats-container:0.94
+        - image: quay.io/sagyvolkov/stats-container:sherlock0.3
           name: stats-${RUN_NAME}
           resources:
             limits:
@@ -174,22 +216,11 @@ spec:
           command:
               - "bash"
               - "-c"
-              - echo "${SDS_NETWORK_INTERFACES}" > /tmp/ocs_network_interfaces; echo "${SDS_DEVICES}" > /tmp/ocs_devices; ./run_all ${STATS_INTERVAL} ${STATS_COUNT} ${node_type}
+              - echo "${SDS_NETWORK_INTERFACES}" > /tmp/sds_network_interfaces; echo "${SDS_DEVICES}" > /tmp/sds_devices; ./run_all ${STATS_INTERVAL} ${STATS_COUNT} ${node_type}
 EOF
 )
 job_name=$(echo ${job_name} | awk '{print $1}')
 stats_pod_name=$(${KUBE_CMD} describe ${job_name} | grep "Created pod:" | awk -F "Created pod: " '{print $2}')
-}
-
-function cordon_control()
-{
-  local cordon_command=${1}
-  local cordon_node=${2}
-  if [[ "${cordon_command}" == "cordon" ]]; then
-    [[ "${KUBE_CMD}" == "oc" ]] && ${KUBE_CMD} adm cordon ${cordon_node} || ${KUBE_CMD} cordon ${cordon_node}
-  else
-    [[ "${KUBE_CMD}" == "oc" ]] && ${KUBE_CMD} adm uncordon ${cordon_node} || ${KUBE_CMD} uncordon ${cordon_node}
-  fi
 }
 
 function stats_collect()
@@ -232,7 +263,7 @@ function calculate_rbd_utilization()
 if [[ "${JOB_TYPE}" == "run" && "${STATS}" == "true" ]]; then
   oc adm policy add-scc-to-user hostnetwork -n${PROJECT_NAME} -z default
   stats_collect worker ${worker_node_array[@]}
-  [[ ${#sds_node_array[@]} -ne 0 ]] && stats_collect ocs ${sds_node_array[@]}
+  [[ ${#sds_node_array[@]} -ne 0 ]] && stats_collect sds ${sds_node_array[@]}
 fi
 
 for ((j=0; j<=${DB_PER_WORKER}*${NUMBER_OF_WORKERS}-1; j++))
@@ -276,14 +307,17 @@ if [[ "${JOB_TYPE}" == "run" ]];then
     ${KUBE_CMD} logs ${jobs_pods[$i]} > ${RUN_NAME}/${jobs_pods[$i]}.log
   done
 
-  if [[ "${STATS}" == "true" && "${RBD_STATS}" == "true" ]]; then
+  if [[ "${STATS}" == "true" && "${RBD_STATS}" == "true" && "${KUBE_CMD}" == "oc" ]]; then
     echo "$(mydate) Getting list of database RBDs from worker nodes and pods ..."
     get_rbd_list
     for node_ip in ${!worker_rbd[@]}
     do
-      file_name=$(ls ${RUN_NAME}/stats-${RUN_NAME}-worker-${node_ip}*.log)
+      file_name=$(ls ${RUN_NAME}/stats-worker-${RUN_NAME}-${node_ip}*.log)
       rbd_device="${worker_rbd[${node_ip}]}"
       calculate_rbd_utilization ${file_name} "${rbd_device}"
     done
   fi
+else
+  echo "$(mydate) Jobs are running in the background. Use \"${KUBE_CMD} get jobs\" to monitor the jobs..."
 fi
+echo "$(mydate) End of $0 script ..."
